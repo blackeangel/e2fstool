@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sparse/sparse.h>
+
 #include <assert.h>
 #include <e2p/e2p.h>
 #include <ext2fs/ext2fs.h>
@@ -14,6 +15,8 @@
 
 #define E2FSTOOL_VERSION "1.0.0"
 #define E2FSTOOL_DATE "30-Mar-2023"
+
+#define E2FSTOOL_ERROR(pfx, ...) printf("%s: %s" pfx "\n", __func__, strerror(errno) __VA_OPT__(,) __VA_ARGS__)
 
 #ifdef HAVE_LIB_NT_H
 #include "libnt.h"
@@ -40,13 +43,18 @@
 #define RESERVED_INODES_COUNT 0xA /* Excluding EXT2_ROOT_INO */
 #define SYMLINK_I_BLOCK_MAX_SIZE 0x3D
 
+#define SPARSE_HEADER_MAGIC 0xed26ff3a
+#define EXT4_SUPERBLOCK_MAGIC 0xef53
+typedef enum image_type {
+    SPARSE,
+    RAW,
+    UNKNOWN
+} image_type_t;
+
 struct inode_params {
-    ext2_filsys fs;
     char *path;
     char *filename;
     __u8 *mountpoint;
-    char *fs_path;
-    char *se_path;
     errcode_t error;
 };
 

@@ -16,8 +16,9 @@ char *in_file = NULL;
 char *out_dir = NULL;
 char *conf_dir = NULL;
 __u8 *mountpoint = NULL;
+FILE *contexts, *filesystem;
 unsigned int android_configure = 0;
-unsigned int android_sparse_file = 1;
+image_type_t image_type = UNKNOWN;
 unsigned int quiet = 0;
 unsigned int verbose = 0;
 
@@ -27,6 +28,63 @@ void usage(int ret)
             "\t [-b blocksize] [-hqlvV] filename [directory]\n",
             prog_name);
     exit(ret);
+}
+
+image_type_t get_image_type(const char *filename)
+{
+    image_type_t type = UNKNOWN;
+    FILE *fp = NULL;
+    uint32_t sparse_magic;
+    uint16_t ext4_magic;
+    int ret;
+
+    fp =  fopen(filename, "rb");
+    if (!fp) {
+        E2FSTOOL_ERROR("while opening file");
+        return UNKNOWN;
+    }
+
+    ret = fread(&sparse_magic, sizeof(sparse_magic), 1, fp);
+    if (ret != 1) {
+        E2FSTOOL_ERROR("while reading sparse_magic number");
+        goto end;
+    }
+
+    ret = fseek(fp, sparse_magic == SPARSE_HEADER_MAGIC ? 0x460 : 0x438, SEEK_SET);
+    if (ret) {
+        E2FSTOOL_ERROR("while seeking to EXT4 magic offset");
+        goto end;
+    }
+
+    ret = fread(&ext4_magic, sizeof(ext4_magic), 1, fp);
+    if (ret != 1) {
+        E2FSTOOL_ERROR("while reading ext4_magic number");
+        goto end;
+    }
+
+    if (sparse_magic == SPARSE_HEADER_MAGIC && ext4_magic == EXT4_SUPERBLOCK_MAGIC) {
+        type = SPARSE;
+    } else if (ext4_magic == EXT4_SUPERBLOCK_MAGIC) {
+        type = RAW;
+    }
+
+end:
+    fclose(fp);
+    return type;
+}
+
+char* escape_regex_meta_chars(char* filepath) {
+    char *escaped = malloc(strlen(filepath) * 2 + 1);
+    char *e = escaped, *p = filepath;
+
+    while (*p) {
+        if (strchr(".^$*+?()[]{}|\\<>", *p)) {
+            *e++ = '\\';
+        }
+        *e++ = *p++;
+    }
+    *e = '\0';
+    return escaped;
 }
 
 errcode_t ino_get_xattr(ext2_filsys fs, ext2_ino_t ino, const char *key, void **val, size_t *val_len)
@@ -101,62 +159,33 @@ end:
     return retval == EXT2_ET_EA_KEY_NOT_FOUND ? 0 : retval;
 }
 
-errcode_t ino_get_config(ext2_ino_t ino, struct ext2_inode inode, char *path, void *priv_data)
+errcode_t ino_get_config(ext2_ino_t ino, struct ext2_inode inode, char *path)
 {
     char *ctx = NULL;
-    FILE *contexts, *filesystem;
     size_t ctx_len;
     uint64_t cap;
-    struct inode_params *params = (struct inode_params *)priv_data;
     errcode_t retval = 0;
 
-    contexts = fopen(params->se_path, "a");
-    if (!contexts)
-        goto end;
-
-    filesystem = fopen(params->fs_path, "a");
-    if (!filesystem) {
-        retval = -1;
-        goto err;
-    }
-
-    retval = ino_get_selinux_xattr(params->fs, ino, (void **)&ctx, &ctx_len);
+    retval = ino_get_selinux_xattr(fs, ino, (void **)&ctx, &ctx_len);
     if (retval)
         return retval;
 
-    retval = ino_get_capabilities_xattr(params->fs, ino, &cap);
+    retval = ino_get_capabilities_xattr(fs, ino, &cap);
     if (retval)
         return retval;
 
-
-    if (ino == EXT2_ROOT_INO) {
-        fprintf(filesystem, "/ %u %u %o capabilities=%lu\n", inode.i_uid, inode.i_gid, inode.i_mode & FILE_MODE_MASK, cap);
-    } else {
-        fprintf(filesystem, "%s %u %u %o capabilities=%lu\n", path, inode.i_uid, inode.i_gid, inode.i_mode & FILE_MODE_MASK, cap);
-    }
+    fprintf(filesystem, "%s %u %u %o capabilities=%lu\n", ino == EXT2_ROOT_INO ? "/" : path, inode.i_uid, inode.i_gid, inode.i_mode & FILE_MODE_MASK, cap);
 
     if (ctx) {
         if (ino == EXT2_ROOT_INO) {
             path[0] ? fprintf(contexts, "(/.*)? %.*s\n", ctx_len, ctx)
                     : fprintf(contexts, "/%s(/.*)? %.*s\n", path, ctx_len, ctx);
         } else {
-            fprintf(contexts, "/%s %.*s\n", path, ctx_len, ctx);
+            char *escaped = escape_regex_meta_chars(path);
+            fprintf(contexts, "/%s %.*s\n", escaped, ctx_len, ctx);
         }
     }
 
-    fclose(filesystem);
-err:
-    fclose(contexts);
-end:
-#define ERROR_MESSAGE "while getting config for inode %u"
-    if (retval) {
-        if (retval != -1) {
-            fprintf(stderr, "%s: %s" ERROR_MESSAGE, __func__, strerror(errno), ino);
-        } else {
-	    com_err(__func__, retval, ERROR_MESSAGE, ino);
-	}
-    }
-#undef ERROR_MESSAGE
     return retval;
 }
 
@@ -170,7 +199,7 @@ errcode_t ino_extract_symlink(ext2_filsys fs, ext2_ino_t ino, struct ext2_inode 
 
     link_target = malloc(i_size + 1);
     if (!link_target) {
-        com_err(__func__, errno, "while allocating memory");
+        E2FSTOOL_ERROR("while allocating memory");
         return EXT2_ET_NO_MEMORY;
     }
 
@@ -206,8 +235,7 @@ errcode_t ino_extract_symlink(ext2_filsys fs, ext2_ino_t ino, struct ext2_inode 
 
     retval = symlink(link_target, path);
     if (retval == -1) {
-        fprintf(stderr, "%s: %s while creating symlink %s", __func__, strerror(errno), path);
-        retval = errno;
+        E2FSTOOL_ERROR("while creating symlink");
     }
 
 end:
@@ -232,8 +260,8 @@ errcode_t ino_extract_regular(ext2_filsys fs, ext2_ino_t ino, const char *path)
 
     fd = open(path, O_WRONLY | O_TRUNC | O_BINARY | O_CREAT, 0644);
     if (fd < 0) {
-        com_err(__func__, errno, "while creating file");
-        return errno;
+        E2FSTOOL_ERROR("while creating file");
+        return -1;
     }
 
     retval = ext2fs_file_open(fs, ino, 0, &e2_file);
@@ -264,7 +292,8 @@ errcode_t ino_extract_regular(ext2_filsys fs, ext2_ino_t ino, const char *path)
                 if (errno & (EINTR | EAGAIN)) {
                     continue;
                 }
-                com_err(__func__, errno, "while writing file");
+                E2FSTOOL_ERROR("while writing file");
+                retval = -1;
                 goto close;
             }
 
@@ -274,8 +303,8 @@ errcode_t ino_extract_regular(ext2_filsys fs, ext2_ino_t ino, const char *path)
     }
 
     if (inode.i_size != written) {
-        errno = EFAULT;
-        com_err(__func__, errno, "while writing file (%u of %u)", written, inode.i_size);
+        E2FSTOOL_ERROR("while writing file (%u of %u)", written, inode.i_size);
+        retval = -1;
     }
 
 close:
@@ -286,8 +315,7 @@ quit:
     ext2fs_free_mem(&buf);
 end:
     close(fd);
-    retval |= close_retval;
-    return retval;
+    return retval ?: close_retval;
 }
 
 int walk_dir(ext2_ino_t dir,
@@ -310,18 +338,18 @@ int walk_dir(ext2_ino_t dir,
     filename_len = asprintf(&params->filename, "%s/%.*s", params->path,
                    name_len, de->name);
     if (filename_len < 0) {
-        params->error = EXT2_ET_NO_MEMORY;
-        return -1;
+        E2FSTOOL_ERROR("while allocating memory");
+        return EXT2_ET_NO_MEMORY;
     }
 
     if (asprintf(&output_file, "%s%.*s", out_dir, filename_len,
                  params->filename) < 0) {
-        params->error = EXT2_ET_NO_MEMORY;
-        retval = -1;
+        E2FSTOOL_ERROR("while allocating memory");
+        retval = EXT2_ET_NO_MEMORY;
         goto end;
     }
 
-    retval = ext2fs_read_inode(params->fs, de->inode, &inode);
+    retval = ext2fs_read_inode(fs, de->inode, &inode);
     if (retval) {
         com_err(__func__, retval, "while reading inode %u", de->inode);
         goto err;
@@ -334,11 +362,12 @@ int walk_dir(ext2_ino_t dir,
                ? asprintf(&config_path, "%.*s", filename_len - 1, params->filename + 1)
                : asprintf(&config_path, "%s%.*s", params->mountpoint, filename_len, params->filename);
         if (retval < 0 || !config_path) {
-            params->error = EXT2_ET_NO_MEMORY;
+            E2FSTOOL_ERROR("while allocating memory");
+            retval = EXT2_ET_NO_MEMORY;
             goto err;
         }
 
-        retval = ino_get_config(de->inode, inode, config_path, params);
+        retval = ino_get_config(de->inode, inode, config_path);
         free(config_path);
 
         if (retval)
@@ -351,7 +380,7 @@ int walk_dir(ext2_ino_t dir,
     if (!quiet && verbose)
         fprintf(stdout, "Extracting %s\n", params->filename + 1);
     else if (!quiet)
-        ext2fs_numeric_progress_update(params->fs, &progress, de->inode);
+        ext2fs_numeric_progress_update(fs, &progress, de->inode);
 
     switch(inode.i_mode & LINUX_S_IFMT) {
         case LINUX_S_IFCHR:
@@ -362,14 +391,14 @@ int walk_dir(ext2_ino_t dir,
         case LINUX_S_IFSOCK:
 #endif
         case LINUX_S_IFLNK:
-            retval = ino_extract_symlink(params->fs, de->inode, &inode, output_file);
+            retval = ino_extract_symlink(fs, de->inode, &inode, output_file);
             if (retval) {
                 goto err;
             }
             break;
 #endif
         case LINUX_S_IFREG:
-            retval = ino_extract_regular(params->fs, de->inode, output_file);
+            retval = ino_extract_regular(fs, de->inode, output_file);
             if (retval) {
                 goto err;
             }
@@ -381,11 +410,11 @@ int walk_dir(ext2_ino_t dir,
 
             retval = mkdir(output_file, inode.i_mode & FILE_MODE_MASK);
             if (retval == -1 && errno != EEXIST) {
-                fprintf(stderr, "%s: %s while creating %s\n", __func__, strerror(errno), output_file);
+                E2FSTOOL_ERROR("while creating %s", output_file);
                 goto err;
             }
 
-            retval = ext2fs_dir_iterate2(params->fs, de->inode, 0, NULL,
+            retval = ext2fs_dir_iterate2(fs, de->inode, 0, NULL,
                              walk_dir, params);
             if (retval) {
                 goto err;
@@ -394,28 +423,26 @@ int walk_dir(ext2_ino_t dir,
             params->filename = cur_filename;
             break;
         default:
-            fprintf(stderr, "%s: warning: unknown entry \"%s\" (%x)\n", __func__, params->filename, inode.i_mode & LINUX_S_IFMT);
+            E2FSTOOL_ERROR("warning: unknown entry \"%s\" (%x)", params->filename, inode.i_mode & LINUX_S_IFMT);
     }
 
 err:
     free(output_file);
 end:
     free(params->filename);
-    return retval ? -1 : 0;
+    return retval;
 }
 
 errcode_t walk_fs(ext2_filsys fs)
 {
     struct ext2_inode inode;
     struct inode_params params = {
-        .fs = fs,
         .path = "",
         .filename = "",
         .mountpoint = NULL,
-        .fs_path = NULL,
-        .se_path = NULL,
         .error = 0
     };
+    char *se_path, *fs_path;
     errcode_t retval = 0;
 
     retval = ext2fs_read_inode(fs, EXT2_ROOT_INO, &inode);
@@ -426,8 +453,8 @@ errcode_t walk_fs(ext2_filsys fs)
 
     retval = mkdir(out_dir, inode.i_mode);
     if (retval == -1 && errno != EEXIST) {
-        fprintf(stderr, "%s: %s while creating %s\n", __func__, strerror(errno), out_dir);
-        return errno;
+        E2FSTOOL_ERROR("while creating %s", out_dir);
+        return retval;
     }
 
     if (android_configure) {
@@ -444,20 +471,25 @@ errcode_t walk_fs(ext2_filsys fs)
 
         retval = mkdir(conf_dir, S_IRWXU | S_IRWXG | S_IRWXO);
         if (retval == -1 && errno != EEXIST) {
-            fprintf(stderr, "%s: %s while creating %s\n", __func__, strerror(errno), conf_dir);
-            return errno;
+            E2FSTOOL_ERROR("while creating %s", conf_dir);
+            return retval;
         }
 
-        if (asprintf(&params.fs_path, "%s/filesystem_config.fs", conf_dir) < 0 ||
-            asprintf(&params.se_path, "%s/selinux_contexts.fs", conf_dir) < 0) {
-            com_err(__func__, EXT2_ET_NO_MEMORY, "while configuring config paths");
-            return 1;
+        se_path = strcat(strdup(conf_dir), "/selinux_contexts.fs");
+        contexts = fopen(se_path, "w");
+        if (!contexts) {
+            retval = -1;
+            goto ctx_end;
         }
 
-        unlink(params.fs_path);
-        unlink(params.se_path);
+        fs_path = strcat(conf_dir, "/filesystem_config.fs");
+        filesystem = fopen(fs_path, "w");
+        if (!filesystem) {
+            retval = -1;
+            goto fs_end;
+        }
 
-        retval = ino_get_config(EXT2_ROOT_INO, inode, (char *)params.mountpoint, &params);
+        retval = ino_get_config(EXT2_ROOT_INO, inode, (char *)params.mountpoint);
         if (retval)
             goto end;
     }
@@ -470,15 +502,17 @@ errcode_t walk_fs(ext2_filsys fs)
     retval = ext2fs_dir_iterate2(fs, EXT2_ROOT_INO, 0, NULL, walk_dir,
                      &params);
     if (retval) {
-        com_err(prog_name, retval != -1 ? retval : params.error, "while interating file system\n");
+       goto end;
     }
 
     if (!quiet && !verbose)
         ext2fs_numeric_progress_close(fs, &progress, "done\n");
 end:
-    free(params.fs_path);
-    free(params.se_path);
-
+    fclose(filesystem);
+fs_end:
+    free(se_path);
+    fclose(contexts);
+ctx_end:
     return retval;
 }
 
@@ -486,12 +520,12 @@ int main(int argc, char *argv[])
 {
     int c, show_version_only = 0, ls = 0;
     io_manager io_mgr = unix_io_manager;
-    errcode_t retval = 0;
+    errcode_t retval = 0, close_retval = 0;
     unsigned int b, blocksize = 0;
 
     add_error_table(&et_ext2_error_table);
 
-    while ((c = getopt (argc, argv, "b:c:ehm:qlvV")) != EOF) {
+    while ((c = getopt (argc, argv, "b:c:hm:lqrsvV")) != EOF) {
         switch (c) {
         case 'b':
             blocksize = parse_num_blocks2(optarg, -1);
@@ -511,8 +545,11 @@ int main(int argc, char *argv[])
             conf_dir = strdup(optarg);
             ++android_configure;
             break;
-        case 'e':
-            --android_sparse_file;
+        case 'r':
+            image_type = RAW;
+            break;
+        case 's':
+            image_type = SPARSE;
             break;
         case 'm':
             if (*optarg != '/') {
@@ -580,7 +617,15 @@ int main(int argc, char *argv[])
         fputs(": ", stderr);
     }
 
-    if (android_sparse_file) {
+    if (image_type == UNKNOWN) {
+        image_type = get_image_type(in_file);
+        if (image_type == UNKNOWN) {
+            fprintf(stderr, "Unknown image type\n");
+            usage(EXIT_FAILURE);
+        }
+    }
+
+    if (image_type == SPARSE) {
         io_mgr = sparse_io_manager;
         if (asprintf(&in_file, "(%s)", in_file) == -1) {
             fprintf(stderr, "Failed to allocate file name\n");
@@ -592,7 +637,7 @@ int main(int argc, char *argv[])
                                   EXT2_FLAG_THREADS | EXT2_FLAG_PRINT_PROGRESS, 0, blocksize, io_mgr, &fs);
     if (retval) {
         fputs("\n\n", stderr);
-        com_err(prog_name, retval, "while opening file %s, try to increase your page/swap file.", in_file);
+        com_err(prog_name, retval, "while opening file %s", in_file);
         exit(EXIT_FAILURE);
     }
 
@@ -614,9 +659,9 @@ int main(int argc, char *argv[])
             fs->super->s_blocks_count - fs->super->s_free_blocks_count -
             RESERVED_INODES_COUNT, out_dir);
 end:
-    retval = ext2fs_close_free(&fs);
-    if (retval) {
-        com_err(prog_name, retval, "%s",
+    close_retval = ext2fs_close_free(&fs);
+    if (retval || close_retval) {
+        com_err(prog_name, retval ?: close_retval, "%s",
                 "while writing superblocks");
         exit(EXIT_FAILURE);
     }
