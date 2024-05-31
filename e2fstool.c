@@ -1,10 +1,7 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
 #include <stdio.h>
 #include <getopt.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "e2fstool.h"
 
@@ -15,17 +12,18 @@ const char *prog_name = "e2fstool";
 char *in_file = NULL;
 char *out_dir = NULL;
 char *conf_dir = NULL;
-__u8 *mountpoint = NULL;
+char *mountpoint = NULL;
 FILE *contexts, *filesystem;
-unsigned int android_configure = 0;
+bool android_configure = false;
+bool system_as_root = false;
 image_type_t image_type = UNKNOWN;
-unsigned int quiet = 0;
-unsigned int verbose = 0;
+bool quiet = false;
+bool verbose = false;
 
 void usage(int ret)
 {
     fprintf(stderr, "%s [-c config_dir] [-m mountpoint]\n"
-            "\t [-b blocksize] [-hqlvV] filename [directory]\n",
+            "\t [-b blocksize] [-ehlqsvV] filename [directory]\n",
             prog_name);
     exit(ret);
 }
@@ -74,11 +72,20 @@ end:
 }
 
 char* escape_regex_meta_chars(char* filepath) {
-    char *escaped = malloc(strlen(filepath) * 2 + 1);
+    size_t len = strlen(filepath) + 1;
+    char *escaped = malloc(len);
     char *e = escaped, *p = filepath;
 
     while (*p) {
         if (strchr(".^$*+?()[]{}|\\<>", *p)) {
+            char *new_escaped = realloc(escaped, ++len);
+            if (new_escaped == NULL) {
+                free(escaped);
+                E2FSTOOL_ERROR("Failed to allocate memory for escaped string %s", filepath);
+                exit(EXIT_FAILURE);
+            }
+            e = new_escaped + (e - escaped);
+            escaped = new_escaped;
             *e++ = '\\';
         }
         *e++ = *p++;
@@ -136,7 +143,6 @@ errcode_t ino_get_capabilities_xattr(ext2_filsys fs, ext2_ino_t ino,
     struct vfs_cap_data *cap_data = NULL;
     size_t len = 0;
 
-    assert(cap);
     *cap = 0;
 
     retval = ino_get_xattr(fs, ino, "security." XATTR_CAPS_SUFFIX, (void **)&cap_data, &len);
@@ -174,18 +180,42 @@ errcode_t ino_get_config(ext2_ino_t ino, struct ext2_inode inode, char *path)
     if (retval)
         return retval;
 
-    fprintf(filesystem, "%s %u %u %o capabilities=%lu\n", ino == EXT2_ROOT_INO ? "/" : path, inode.i_uid, inode.i_gid, inode.i_mode & FILE_MODE_MASK, cap);
+    fprintf(filesystem, "%s %u %u %o capabilities=%llu\n", ino == EXT2_ROOT_INO ? "/" : path, inode.i_uid, inode.i_gid, inode.i_mode & FILE_MODE_MASK, cap);
 
     if (ctx) {
-        if (ino == EXT2_ROOT_INO) {
-            path[0] ? fprintf(contexts, "(/.*)? %.*s\n", ctx_len, ctx)
-                    : fprintf(contexts, "/%s(/.*)? %.*s\n", path, ctx_len, ctx);
-        } else {
-            char *escaped = escape_regex_meta_chars(path);
-            fprintf(contexts, "/%s %.*s\n", escaped, ctx_len, ctx);
-        }
-    }
+        char *context = NULL, *start = NULL, *escaped = NULL;
+        size_t len = ctx_len + 2;
 
+        if (ino == EXT2_ROOT_INO) {
+            len += 6;
+        }
+
+        if (ino != EXT2_ROOT_INO || !system_as_root) {
+            if (system_as_root)
+                path++;
+            escaped = escape_regex_meta_chars(path);
+            len += strlen(escaped) + 1;
+        }
+
+        context = malloc(len);
+        start = context;
+        if (!context) {
+            E2FSTOOL_ERROR("while allocating memory");
+            exit(EXIT_FAILURE);
+        }
+
+        if (ino != EXT2_ROOT_INO || !system_as_root) {
+            context += snprintf(context, strlen(escaped) + 2, "/%s", escaped);
+            free(escaped);
+        }
+
+        if (ino == EXT2_ROOT_INO) {
+            context += snprintf(context, 7, "(/.*)?");
+        }
+
+        context += snprintf(context, ctx_len + 2, " %s\n", ctx);
+        fwrite(start, 1, len - 1, contexts);
+    }
     return retval;
 }
 
@@ -335,14 +365,16 @@ int walk_dir(ext2_ino_t dir,
     if (!strncmp(de->name, ".", name_len) || (!strncmp(de->name, "..", name_len)))
         return 0;
 
-    filename_len = asprintf(&params->filename, "%s/%.*s", params->path,
+    params->filename = malloc(name_len + params->len + 2);
+    filename_len = snprintf(params->filename, name_len + params->len + 2, "%s/%.*s", params->path,
                    name_len, de->name);
     if (filename_len < 0) {
         E2FSTOOL_ERROR("while allocating memory");
         return EXT2_ET_NO_MEMORY;
     }
 
-    if (asprintf(&output_file, "%s%.*s", out_dir, filename_len,
+    output_file = malloc(strlen(out_dir) + filename_len + 1);
+    if (snprintf(output_file, strlen(out_dir) + filename_len + 1, "%s%s", out_dir,
                  params->filename) < 0) {
         E2FSTOOL_ERROR("while allocating memory");
         retval = EXT2_ET_NO_MEMORY;
@@ -358,9 +390,8 @@ int walk_dir(ext2_ino_t dir,
     if (android_configure) {
         char *config_path = NULL;
 
-        retval = !params->mountpoint[0]
-               ? asprintf(&config_path, "%.*s", filename_len - 1, params->filename + 1)
-               : asprintf(&config_path, "%s%.*s", params->mountpoint, filename_len, params->filename);
+        config_path = malloc(strlen(mountpoint) + filename_len + 1);
+        retval = snprintf(config_path, strlen(mountpoint) + filename_len + 1, "%s%s", (char *)mountpoint, params->filename);
         if (retval < 0 || !config_path) {
             E2FSTOOL_ERROR("while allocating memory");
             retval = EXT2_ET_NO_MEMORY;
@@ -377,9 +408,9 @@ int walk_dir(ext2_ino_t dir,
     if (dir == EXT2_ROOT_INO &&
         !strncmp(de->name, "lost+found", name_len)) goto err;
 
-    if (!quiet && verbose)
+    if (!quiet && verbose) {
         fprintf(stdout, "Extracting %s\n", params->filename + 1);
-    else if (!quiet)
+    } else if (!quiet)
         ext2fs_numeric_progress_update(fs, &progress, de->inode);
 
     switch(inode.i_mode & LINUX_S_IFMT) {
@@ -407,13 +438,13 @@ int walk_dir(ext2_ino_t dir,
             char *cur_path = params->path;
             char *cur_filename = params->filename;
             params->path = params->filename;
+            params->len = filename_len;
 
             retval = mkdir(output_file, inode.i_mode & FILE_MODE_MASK);
             if (retval == -1 && errno != EEXIST) {
                 E2FSTOOL_ERROR("while creating %s", output_file);
                 goto err;
             }
-
             retval = ext2fs_dir_iterate2(fs, de->inode, 0, NULL,
                              walk_dir, params);
             if (retval) {
@@ -425,7 +456,6 @@ int walk_dir(ext2_ino_t dir,
         default:
             E2FSTOOL_ERROR("warning: unknown entry \"%s\" (%x)", params->filename, inode.i_mode & LINUX_S_IFMT);
     }
-
 err:
     free(output_file);
 end:
@@ -439,8 +469,7 @@ errcode_t walk_fs(ext2_filsys fs)
     struct inode_params params = {
         .path = "",
         .filename = "",
-        .mountpoint = NULL,
-        .error = 0
+        .len = 0
     };
     char *se_path, *fs_path;
     errcode_t retval = 0;
@@ -458,16 +487,17 @@ errcode_t walk_fs(ext2_filsys fs)
     }
 
     if (android_configure) {
-        if (mountpoint)
-            params.mountpoint = mountpoint;
+        if (mountpoint) ;
         else if (fs->super->s_last_mounted[0])
-            params.mountpoint = fs->super->s_last_mounted;
+            mountpoint = (char *)fs->super->s_last_mounted;
         else if (fs->super->s_volume_name[0])
-            params.mountpoint = fs->super->s_volume_name;
+            mountpoint = (char *)fs->super->s_volume_name;
         else
-            params.mountpoint = (__u8 *)out_dir;
+            mountpoint = out_dir;
 
-        if (*params.mountpoint == '/') ++params.mountpoint;
+        ++mountpoint;
+        if (!mountpoint[0])
+            system_as_root = true;
 
         retval = mkdir(conf_dir, S_IRWXU | S_IRWXG | S_IRWXO);
         if (retval == -1 && errno != EEXIST) {
@@ -489,7 +519,7 @@ errcode_t walk_fs(ext2_filsys fs)
             goto fs_end;
         }
 
-        retval = ino_get_config(EXT2_ROOT_INO, inode, (char *)params.mountpoint);
+        retval = ino_get_config(EXT2_ROOT_INO, inode, (char *)mountpoint);
         if (retval)
             goto end;
     }
@@ -508,10 +538,13 @@ errcode_t walk_fs(ext2_filsys fs)
     if (!quiet && !verbose)
         ext2fs_numeric_progress_close(fs, &progress, "done\n");
 end:
-    fclose(filesystem);
+    if (android_configure)
+        fclose(filesystem);
 fs_end:
-    free(se_path);
-    fclose(contexts);
+    if (android_configure) {
+        free(se_path);
+        fclose(contexts);
+    }
 ctx_end:
     return retval;
 }
@@ -525,7 +558,7 @@ int main(int argc, char *argv[])
 
     add_error_table(&et_ext2_error_table);
 
-    while ((c = getopt (argc, argv, "b:c:hm:lqrsvV")) != EOF) {
+    while ((c = getopt (argc, argv, "b:c:ehlm:qsvV")) != EOF) {
         switch (c) {
         case 'b':
             blocksize = parse_num_blocks2(optarg, -1);
@@ -545,7 +578,7 @@ int main(int argc, char *argv[])
             conf_dir = strdup(optarg);
             ++android_configure;
             break;
-        case 'r':
+        case 'e':
             image_type = RAW;
             break;
         case 's':
@@ -556,7 +589,7 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "Invalid mountpoint %s", optarg);
                 exit(EXIT_FAILURE);
             }
-            mountpoint = (__u8 *)strdup(optarg);
+            mountpoint = optarg;
             break;
         case 'h':
             usage(EXIT_SUCCESS);
@@ -593,8 +626,8 @@ int main(int argc, char *argv[])
 
             out_dir = strdup(argv[optind++]);
         }
-	
-	if (optind < argc) {
+    
+        if (optind < argc) {
             fprintf(stderr, "Unexpected argument: %s\n", argv[optind]);
             usage(EXIT_FAILURE);
         }
@@ -627,10 +660,13 @@ int main(int argc, char *argv[])
 
     if (image_type == SPARSE) {
         io_mgr = sparse_io_manager;
-        if (asprintf(&in_file, "(%s)", in_file) == -1) {
+        char *new_in_file = malloc(strlen(in_file) + 3);
+        if (sprintf(new_in_file, "(%s)", in_file) == -1) {
             fprintf(stderr, "Failed to allocate file name\n");
             exit(EXIT_FAILURE);
         }
+        free(in_file);
+        in_file = new_in_file;
     }
 
     retval = ext2fs_open(in_file, EXT2_FLAG_64BITS | EXT2_FLAG_EXCLUSIVE |
@@ -651,7 +687,7 @@ int main(int argc, char *argv[])
         goto end;
 
     retval = walk_fs(fs);
-	if (retval)
+    if (retval)
         goto end;
 
     fprintf(stdout, "\nWritten %u inodes (%u blocks) to \"%s\"\n",
@@ -660,16 +696,18 @@ int main(int argc, char *argv[])
             RESERVED_INODES_COUNT, out_dir);
 end:
     close_retval = ext2fs_close_free(&fs);
-    if (retval || close_retval) {
-        com_err(prog_name, retval ?: close_retval, "%s",
-                "while writing superblocks");
-        exit(EXIT_FAILURE);
+    if (close_retval) {
+        com_err(prog_name, close_retval, "%s",
+                "while closing filesystem");
+    }
+    if (retval) {
+        com_err(prog_name, retval, "%s",
+                "while walking filesystem");
     }
 
     free(in_file);
     free(out_dir);
     free(conf_dir);
-    free(mountpoint);
     remove_error_table(&et_ext2_error_table);
-    return EXIT_SUCCESS;
+    return close_retval || retval ? EXIT_FAILURE : EXIT_SUCCESS;
 }
