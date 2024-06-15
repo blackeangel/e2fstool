@@ -378,7 +378,6 @@ errcode_t ino_extract_regular(ext2_filsys fs, ext2_ino_t ino, const char *path)
             goto close;
         }
 
-        got -= nbytes;
         written += nbytes;
     } while (got);
 
@@ -578,6 +577,7 @@ static errcode_t walk_fs(ext2_filsys fs)
             return retval;
         }
     }
+
     if (android_configure)
     {
         if (mountpoint)
@@ -632,6 +632,17 @@ static errcode_t walk_fs(ext2_filsys fs)
     {
         goto end;
     }
+
+#ifdef SVB_MINGW
+    if (!android_configure_only)
+    {
+        retval = set_path_timestamp(out_dir, inode.i_atime, inode.i_mtime, inode.i_ctime);
+        if (retval)
+        {
+            E2FSTOOL_ERROR("while configuring timestamps for %s", out_dir);
+        }
+    }
+#endif
 
     if (!quiet && !verbose)
         ext2fs_numeric_progress_close(fs, &progress, "done\n");

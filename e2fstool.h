@@ -14,7 +14,7 @@
 #include <private/android_filesystem_capability.h>
 
 #define E2FSTOOL_VERSION "1.0.0"
-#define E2FSTOOL_DATE "16-July-2024"
+#define E2FSTOOL_DATE "15-July-2024"
 
 #define E2FSTOOL_ERROR(pfx, ...) printf("%s: %s " pfx "\n", __func__, strerror(errno) __VA_OPT__(,) __VA_ARGS__)
 
