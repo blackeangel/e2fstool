@@ -39,10 +39,12 @@
 #define SYMLINK_I_BLOCK_MAX_SIZE 0x3D
 
 #define SPARSE_HEADER_MAGIC 0xed26ff3a
+#define MOTO_HEADER_MAGIC 0x4f544f4d
 
 typedef enum image_type {
     SPARSE,
     RAW,
+    MOTO,
     UNKNOWN
 } image_type_t;
 

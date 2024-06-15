@@ -30,11 +30,26 @@ static void usage(int ret)
     exit(ret);
 }
 
+static const char* get_image_type_str(image_type_t type)
+{
+    switch (type)
+    {
+    case SPARSE:
+        return "SPARSE";
+    case RAW:
+        return "RAW";
+    case MOTO:
+        return "MOTO";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 static image_type_t get_image_type(const char *filename)
 {
     image_type_t type = UNKNOWN;
     FILE *fp = NULL;
-    uint32_t sparse_magic;
+    uint32_t sparse_magic, moto_magic;
     uint16_t ext4_magic;
     int ret;
 
@@ -52,7 +67,21 @@ static image_type_t get_image_type(const char *filename)
         goto end;
     }
 
-    ret = fseek(fp, sparse_magic == SPARSE_HEADER_MAGIC ? 0x460 : 0x438, SEEK_SET);
+    ret = fseek(fp, 0x28, SEEK_SET);
+    if (ret)
+    {
+        E2FSTOOL_ERROR("while seeking to MOTO magic offset");
+        goto end;
+    }
+
+    ret = fread(&moto_magic, sizeof(moto_magic), 1, fp);
+    if (ret != 1)
+    {
+        E2FSTOOL_ERROR("while reading moto_magic number");
+        goto end;
+    }
+
+    ret = fseek(fp, 0x438, SEEK_SET);
     if (ret)
     {
         E2FSTOOL_ERROR("while seeking to EXT4 magic offset");
@@ -66,9 +95,13 @@ static image_type_t get_image_type(const char *filename)
         goto end;
     }
 
-    if (sparse_magic == SPARSE_HEADER_MAGIC && ext4_magic == EXT2_SUPER_MAGIC)
+    if (sparse_magic == SPARSE_HEADER_MAGIC)
     {
         type = SPARSE;
+    }
+    else if (moto_magic == MOTO_HEADER_MAGIC)
+    {
+        type = MOTO;
     }
     else if (ext4_magic == EXT2_SUPER_MAGIC)
     {
@@ -792,17 +825,22 @@ int main(int argc, char *argv[])
 
     if (!quiet)
     {
-        printf("Opening %s image file", image_type == SPARSE ? "SPARSE" : "RAW");
+        printf("Opening %s image file", get_image_type_str(image_type));
         if (blocksize)
             printf(" with blocksize of %u", blocksize);
         printf(": ");
     }
 
-    if (image_type == SPARSE)
+    if (image_type != RAW)
     {
         char *new_in_file = NULL;
-        io_mgr = sparse_io_manager;
-        if (asprintf(&new_in_file, "(%s)", in_file) == -1)
+
+        if (image_type == SPARSE)
+            io_mgr = sparse_io_manager;
+        else
+            io_mgr = moto_io_manager;
+    
+        if (asprintf(&new_in_file, "(%s):0:%u", in_file, blocksize) == -1)
         {
             E2FSTOOL_ERROR("while allocating file name");
             exit(EXIT_FAILURE);
