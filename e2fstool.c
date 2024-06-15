@@ -30,7 +30,7 @@ static void usage(int ret)
     exit(ret);
 }
 
-static const char* get_image_type_str(image_type_t type)
+static const char *get_image_type_str(image_type_t type)
 {
     switch (type)
     {
@@ -95,13 +95,13 @@ static image_type_t get_image_type(const char *filename)
         goto end;
     }
 
-    if (sparse_magic == SPARSE_HEADER_MAGIC)
-    {
-        type = SPARSE;
-    }
-    else if (moto_magic == MOTO_HEADER_MAGIC)
+    if (sparse_magic == SPARSE_HEADER_MAGIC && moto_magic == MOTO_HEADER_MAGIC)
     {
         type = MOTO;
+    }
+    else if (sparse_magic == SPARSE_HEADER_MAGIC)
+    {
+        type = SPARSE;
     }
     else if (ext4_magic == EXT2_SUPER_MAGIC)
     {
@@ -839,7 +839,7 @@ int main(int argc, char *argv[])
             io_mgr = sparse_io_manager;
         else
             io_mgr = moto_io_manager;
-    
+
         if (asprintf(&new_in_file, "(%s):0:%u", in_file, blocksize) == -1)
         {
             E2FSTOOL_ERROR("while allocating file name");
