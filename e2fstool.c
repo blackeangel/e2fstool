@@ -616,9 +616,9 @@ static errcode_t walk_fs(ext2_filsys fs)
         if (mountpoint)
             ;
         else if (fs->super->s_last_mounted[0])
-            mountpoint = (char *)fs->super->s_last_mounted;
+            mountpoint = strdup((char *)fs->super->s_last_mounted);
         else if (fs->super->s_volume_name[0])
-            mountpoint = (char *)fs->super->s_volume_name;
+            asprintf(&mountpoint, "/%s", (char *)fs->super->s_volume_name);
         else
             mountpoint = out_dir;
 
@@ -633,7 +633,11 @@ static errcode_t walk_fs(ext2_filsys fs)
             return retval;
         }
 
-        asprintf(&se_path, "%s/selinux_contexts.fs", conf_dir);
+        if (asprintf(&se_path, "%s/selinux_contexts.fs", conf_dir) < 0) {
+            E2FSTOOL_ERROR("while allocating memory");
+            return EXT2_ET_NO_MEMORY;
+        }
+
         contexts = fopen(se_path, "w");
         if (!contexts)
         {
@@ -641,7 +645,11 @@ static errcode_t walk_fs(ext2_filsys fs)
             goto ctx_end;
         }
 
-        asprintf(&fs_path, "%s/filesystem_config.fs", conf_dir);
+        if (asprintf(&fs_path, "%s/filesystem_config.fs", conf_dir) < 0) {
+            E2FSTOOL_ERROR("while allocating memory");
+            retval = EXT2_ET_NO_MEMORY;
+            goto fs_end;
+        }
         filesystem = fopen(fs_path, "w");
         if (!filesystem)
         {
