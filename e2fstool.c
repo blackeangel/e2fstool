@@ -399,12 +399,13 @@ errcode_t ino_extract_regular(ext2_filsys fs, ext2_ino_t ino, const char *path)
             goto quit;
         }
 
+retry:
         nbytes = write(fd, buf, got);
         if (nbytes < 0)
         {
             if (errno & (EINTR | EAGAIN))
             {
-                continue;
+                goto retry;
             }
             E2FSTOOL_ERROR("while writing file");
             retval = -1;
@@ -412,7 +413,7 @@ errcode_t ino_extract_regular(ext2_filsys fs, ext2_ino_t ino, const char *path)
         }
 
         written += nbytes;
-    } while (got);
+    } while (written < inode.i_size);
 
     if (inode.i_size != written)
     {
@@ -617,10 +618,15 @@ static errcode_t walk_fs(ext2_filsys fs)
             ;
         else if (fs->super->s_last_mounted[0])
             mountpoint = strdup((char *)fs->super->s_last_mounted);
-        else if (fs->super->s_volume_name[0])
-            asprintf(&mountpoint, "/%s", (char *)fs->super->s_volume_name);
+        else if (fs->super->s_volume_name[0]) {
+            if (asprintf(&mountpoint, "/%s", (char *)fs->super->s_volume_name) < 0)
+            {
+                E2FSTOOL_ERROR("while allocating memory");
+                return EXT2_ET_NO_MEMORY;
+            }
+        }
         else
-            mountpoint = out_dir;
+            mountpoint = strdup(out_dir);
 
         ++mountpoint;
         if (!mountpoint[0])
